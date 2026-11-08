@@ -12,19 +12,20 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 username TEXT,
-                role TEXT NOT NULL,
-                full_name TEXT NOT NULL,
-                institution TEXT NOT NULL,
+                role TEXT,
+                full_name TEXT,
+                institution TEXT,
                 faculty TEXT,
-                group_name TEXT NOT NULL,
-                students_count INTEGER NOT NULL,
+                group_name TEXT,
+                students_count INTEGER,
                 chat_platform TEXT,
                 schedule_source TEXT,
                 cancel_frequency TEXT,
                 cancel_channel TEXT,
                 curator_report TEXT,
                 pilot_readiness TEXT,
-                contact TEXT NOT NULL,
+                routine_info TEXT,
+                contact TEXT,
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -51,6 +52,7 @@ async def init_db():
             "cancel_channel": "TEXT",
             "curator_report": "TEXT",
             "pilot_readiness": "TEXT",
+            "routine_info": "TEXT",
             "status": "TEXT DEFAULT 'pending'"
         }
 
