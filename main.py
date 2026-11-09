@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+import urllib.parse
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -169,14 +170,20 @@ def get_confirmation_keyboard() -> InlineKeyboardMarkup:
         ]
     ])
 
+def build_contact_url(template: str = "Здравствуйте! Пишу по поводу проекта «РИТМ».") -> str:
+    return "https://t.me/spizhy?text=" + urllib.parse.quote(template)
+
 def get_start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Подать заявку на пилот", callback_data="action_start_apply")
+            InlineKeyboardButton(text="🚀 Подать заявку на пилот", callback_data="action_start_apply")
         ],
         [
-            InlineKeyboardButton(text="О проекте «Ритм»", callback_data="action_about"),
-            InlineKeyboardButton(text="Задать вопрос (@spizhy)", url="https://t.me/spizhy")
+            InlineKeyboardButton(text="📖 О проекте «Ритм»", callback_data="action_about"),
+            InlineKeyboardButton(
+                text="💬 Написать координатору",
+                url=build_contact_url("Здравствуйте! Пишу по поводу проекта «РИТМ».")
+            )
         ]
     ])
 
@@ -640,10 +647,14 @@ async def process_confirmation(callback: types.CallbackQuery, state: FSMContext,
     except Exception as e:
         logger.error(f"Error saving to database: {e}")
         await callback.answer("Ошибка при сохранении заявки. Попробуйте снова.", show_alert=True)
+        err_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="💬 Написать координатору (@spizhy)", url=build_contact_url("Здравствуйте! Возникла ошибка при сохранении заявки в боте «РИТМ»."))
+        ]])
         await callback.message.edit_text(
             "⚠️ **Произошла техническая ошибка при сохранении заявки.**\n\n"
             "Пожалуйста, начните заново с помощью команды /apply или напишите координатору: @spizhy",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=err_kb
         )
         await state.clear()
         return
@@ -660,7 +671,13 @@ async def process_confirmation(callback: types.CallbackQuery, state: FSMContext,
         "Сроки пилота: **20–26 ноября 2026 года**.\n"
         "Координатор проекта: @spizhy"
     )
-    await callback.message.edit_text(applicant_text, parse_mode="Markdown")
+    applicant_done_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="💬 Задать вопрос координатору",
+            url=build_contact_url(f"Здравствуйте! Пишу по поводу поданной заявки #{app_id} на пилот «РИТМ».")
+        )
+    ]])
+    await callback.message.edit_text(applicant_text, parse_mode="Markdown", reply_markup=applicant_done_kb)
 
     # Notification for Admins with Approve/Reject Action Buttons
     admin_notification = (
@@ -728,8 +745,9 @@ async def process_admin_approve(callback: types.CallbackQuery, bot: Bot):
     # Keep only the direct contact button if username exists
     new_kb = None
     if app_data and app_data.get("username"):
+        to_starosta_msg = urllib.parse.quote(f"Здравствуйте, {app_data.get('full_name', '')}! Я координатор проекта «РИТМ» (@spizhy) по поводу вашей заявки #{app_id} на пилот.")
         new_kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Написать в Telegram", url=f"https://t.me/{app_data['username']}")
+            InlineKeyboardButton(text="💬 Написать старосте в Telegram", url=f"https://t.me/{app_data['username']}?text={to_starosta_msg}")
         ]])
 
     try:
@@ -746,11 +764,19 @@ async def process_admin_approve(callback: types.CallbackQuery, bot: Bot):
             "в чат группы и первичной настройки расписания.\n\n"
             "Если у вас есть срочные вопросы или предложения: @spizhy"
         )
+        group_name = app_data.get('group_name', '')
+        applicant_approve_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="💬 Написать координатору (@spizhy)",
+                url=build_contact_url(f"Здравствуйте! Пишу по поводу проекта «РИТМ» (наша заявка #{app_id} для группы {group_name} одобрена на пилот).")
+            )
+        ]])
         try:
             await bot.send_message(
                 chat_id=app_data["user_id"],
                 text=applicant_notification,
-                parse_mode="Markdown"
+                parse_mode="Markdown",
+                reply_markup=applicant_approve_kb
             )
             logger.info(f"Approval notification sent to applicant {app_data['user_id']}")
         except Exception as e:
@@ -793,11 +819,18 @@ async def process_admin_reject(callback: types.CallbackQuery, bot: Bot):
             "Мы сохранили ваши данные и обязательно предложим подключение на декабрьском этапе!\n"
             "Спасибо за интерес к проекту «РИТМ»!"
         )
+        reject_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="💬 Написать координатору (@spizhy)",
+                url=build_contact_url(f"Здравствуйте! Пишу по поводу заявки #{app_id} на пилот «РИТМ».")
+            )
+        ]])
         try:
             await bot.send_message(
                 chat_id=app_data["user_id"],
                 text=rejection_notification,
-                parse_mode="Markdown"
+                parse_mode="Markdown",
+                reply_markup=reject_kb
             )
         except Exception as e:
             logger.error(f"Failed to send rejection message to applicant: {e}")
