@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import urllib.parse
+from datetime import datetime, timezone, timedelta
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -27,6 +28,14 @@ from database import (
     get_recent_applications,
     add_admin,
     get_admins,
+    bind_group_chat,
+    get_bound_group,
+    get_chats_by_group,
+    get_all_active_group_chats,
+    get_group_schedule,
+    save_cancellation,
+    register_chat_rollcall,
+    get_rollcall_summary,
 )
 
 # Configure logging
@@ -835,6 +844,458 @@ async def process_admin_reject(callback: types.CallbackQuery, bot: Bot):
         except Exception as e:
             logger.error(f"Failed to send rejection message to applicant: {e}")
 
+# ================= GROUP CHAT CAPABILITIES & NOTIFICATIONS =================
+
+async def get_target_group(message: types.Message) -> str:
+    """Определяет группу для текущего чата или личных сообщений"""
+    bound = await get_bound_group(message.chat.id)
+    if bound:
+        return bound
+    try:
+        from database import get_recent_applications
+        apps = await get_recent_applications(limit=30)
+        user_app = next((a for a in apps if a.get('user_id') == message.from_user.id), None)
+        if user_app and user_app.get('group_name'):
+            return user_app['group_name']
+    except Exception:
+        pass
+    return "ИВТ-21"
+
+def format_schedule_message(group: str, weekday: str, lessons: list[dict], is_today: bool = True) -> str:
+    title_prefix = "СЕГОДНЯ" if is_today else "ЗАВТРА"
+    if not lessons:
+        return f"📅 **Расписание на {weekday.lower()} ({group}):**\n\n_В этот день занятий нет или расписание не заполнено._"
+
+    msg = f"📅 **РАСПИСАНИЕ НА {title_prefix} ({weekday.upper()})**\n"
+    msg += f"Группа: **{group}** • Нечетная неделя\n\n"
+
+    for idx, l in enumerate(lessons, 1):
+        status = l.get('status', 'PLANNED')
+        badge = ""
+        if status == 'CANCELLED':
+            badge = " 🔴 **[ОТМЕНА]**"
+        elif status == 'DEADLINE':
+            badge = " 🟠 **[ДЕДЛАЙН]**"
+        elif status == 'RESCHEDULED':
+            badge = " 🟣 **[ПЕРЕНОС]**"
+        elif status == 'ONLINE':
+            badge = " 🔵 **[ДИСТАНТ]**"
+        else:
+            badge = " 🟢 **[ПО ПЛАНУ]**"
+
+        msg += f"**{idx}.** `{l['time_start']}–{l['time_end']}` | **{l['subject']}**{badge}\n"
+        msg += f"   ↳ {l.get('room', 'Ауд. не указана')} • {l.get('teacher', 'Преподаватель не указан')}\n"
+        if l.get('note'):
+            msg += f"   ↳ ℹ️ _{l['note']}_\n"
+
+    msg += "\n💡 Открыть полное расписание и перекличку: [РИТМ Mini App](https://spizhy.github.io/ritm/app.html)"
+    return msg
+
+def format_week_schedule_message(group: str, lessons: list[dict]) -> str:
+    if not lessons:
+        return f"📅 **Расписание на неделю ({group}):**\n\n_Расписание пока не загружено._"
+
+    by_day: dict[str, list[dict]] = {}
+    for l in lessons:
+        d = l.get('weekday', 'Понедельник')
+        by_day.setdefault(d, []).append(l)
+
+    msg = f"🗓 **РАСПИСАНИЕ НА НЕДЕЛЮ (ГРУППА {group})**\n\n"
+    order = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
+
+    for day in order:
+        if day in by_day:
+            msg += f"📌 **{day}:**\n"
+            for l in by_day[day]:
+                badge = " [ОТМЕНА]" if l.get('status') == 'CANCELLED' else ""
+                msg += f"  • `{l['time_start']}–{l['time_end']}` {l['subject']}{badge} ({l.get('room', '')})\n"
+            msg += "\n"
+
+    msg += "💡 Управление и перекличка: [РИТМ Mini App](https://spizhy.github.io/ritm/app.html)"
+    return msg
+
+# --- Команда привязки чата к группе ---
+@dp.message(Command("bind"))
+async def cmd_bind_chat(message: types.Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer(
+            "⚠️ **Укажите название группы для привязки.**\n\n"
+            "Пример: `/bind ИВТ-21`\n"
+            "После этого бот начнет присылать в этот чат утренние дайджесты и оповещения об отменах от старосты.",
+            parse_mode="Markdown"
+        )
+        return
+
+    group_name = args[1].strip().upper()
+    chat_title = message.chat.title or f"Личный диалог ({message.chat.id})"
+    await bind_group_chat(message.chat.id, group_name, chat_title, message.from_user.id)
+
+    reply_text = (
+        f"✅ **Чат успешно привязан к группе {group_name}!**\n\n"
+        "Теперь в этом чате доступны все возможности «РИТМ»:\n"
+        "• 📢 **Мгновенные оповещения** об отменах и переносах пар от старосты\n"
+        "• 🌅 **Утренний дайджест** расписания каждый день в 07:30\n"
+        "• 📋 **Интерактивная перекличка**: `/rollcall`\n"
+        "• 📅 **Команды расписания**: `/today`, `/tomorrow`, `/week`\n"
+        "• ✏️ **Отмена пары старостой**: `/cancel_class`\n\n"
+        "🌐 [Открыть РИТМ Mini App](https://spizhy.github.io/ritm/app.html)"
+    )
+    await message.answer(reply_text, parse_mode="Markdown", disable_web_page_preview=True)
+
+# --- Команда расписания на сегодня ---
+@dp.message(Command("today"))
+async def cmd_today(message: types.Message):
+    group = await get_target_group(message)
+    msk_tz = timezone(timedelta(hours=3))
+    now_msk = datetime.now(msk_tz)
+    weekdays_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    today_weekday = weekdays_ru[now_msk.weekday()]
+
+    if today_weekday == "Воскресенье":
+        today_weekday = "Понедельник"
+
+    lessons = await get_group_schedule(group, today_weekday)
+    if not lessons:
+        lessons = await get_group_schedule(group, "Пятница")
+        today_weekday = "Пятница"
+
+    text = format_schedule_message(group, today_weekday, lessons, is_today=True)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📱 Открыть РИТМ Mini App", url="https://spizhy.github.io/ritm/app.html"),
+        InlineKeyboardButton(text="📋 Перекличка", callback_data=f"rc_refresh_{group}")
+    ]])
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True)
+
+# --- Команда расписания на завтра ---
+@dp.message(Command("tomorrow"))
+async def cmd_tomorrow(message: types.Message):
+    group = await get_target_group(message)
+    msk_tz = timezone(timedelta(hours=3))
+    now_msk = datetime.now(msk_tz)
+    weekdays_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    tomorrow_weekday = weekdays_ru[(now_msk.weekday() + 1) % 7]
+    if tomorrow_weekday == "Воскресенье":
+        tomorrow_weekday = "Понедельник"
+
+    lessons = await get_group_schedule(group, tomorrow_weekday)
+    text = format_schedule_message(group, tomorrow_weekday, lessons, is_today=False)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📱 Открыть РИТМ Mini App", url="https://spizhy.github.io/ritm/app.html")
+    ]])
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True)
+
+# --- Команда расписания на неделю ---
+@dp.message(Command("week"))
+async def cmd_week(message: types.Message):
+    group = await get_target_group(message)
+    lessons = await get_group_schedule(group)
+    text = format_week_schedule_message(group, lessons)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📱 Открыть РИТМ Mini App", url="https://spizhy.github.io/ritm/app.html")
+    ]])
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True)
+
+# --- Команда интерактивной переклички группы ---
+@dp.message(Command("rollcall"))
+async def cmd_rollcall(message: types.Message):
+    group = await get_target_group(message)
+    summary = await get_rollcall_summary(group)
+
+    text = (
+        f"📋 **ПЕРЕКЛИЧКА ГРУППЫ {group}**\n\n"
+        "Отметьте ваш текущий статус присутствия на парах:\n"
+        f"• ✅ На парах: **{summary['counts']['present']}** чел.\n"
+        f"• ⏳ Опаздывают: **{summary['counts']['late']}** чел.\n"
+        f"• 📄 Уважительная: **{summary['counts']['excuse']}** чел.\n"
+        f"• ❌ Отсутствуют: **{summary['counts']['absent']}** чел.\n\n"
+        f"📊 Всего отмечено: **{summary['total']} чел.**"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ На парах", callback_data=f"rc_present_{group}"),
+            InlineKeyboardButton(text="⏳ Опаздываю", callback_data=f"rc_late_{group}")
+        ],
+        [
+            InlineKeyboardButton(text="📄 Уважительная", callback_data=f"rc_excuse_{group}"),
+            InlineKeyboardButton(text="❌ Отсутствую", callback_data=f"rc_absent_{group}")
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Обновить сводку", callback_data=f"rc_refresh_{group}"),
+            InlineKeyboardButton(text="📱 Открыть в Mini App", url="https://spizhy.github.io/ritm/app.html")
+        ]
+    ])
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
+# --- Обработка голосования в перекличке ---
+@dp.callback_query(F.data.startswith("rc_"))
+async def process_rollcall_vote(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    action = parts[1]  # present, late, excuse, absent, refresh
+    group = parts[2] if len(parts) > 2 else "ИВТ-21"
+
+    status_labels = {
+        'present': '✅ На парах',
+        'late': '⏳ Опаздывает',
+        'excuse': '📄 Уважительная',
+        'absent': '❌ Отсутствует'
+    }
+
+    if action in status_labels:
+        user = callback.from_user
+        full_name = f"{user.first_name} {user.last_name or ''}".strip()
+        username = user.username or ""
+        await register_chat_rollcall(group, user.id, full_name, username, action)
+        await callback.answer(f"Принято: {status_labels[action]}", show_alert=False)
+
+    summary = await get_rollcall_summary(group)
+    text = (
+        f"📋 **ПЕРЕКЛИЧКА ГРУППЫ {group}**\n\n"
+        "Отметьте ваш текущий статус присутствия на парах:\n"
+        f"• ✅ На парах: **{summary['counts']['present']}** чел.\n"
+        f"• ⏳ Опаздывают: **{summary['counts']['late']}** чел.\n"
+        f"• 📄 Уважительная: **{summary['counts']['excuse']}** чел.\n"
+        f"• ❌ Отсутствуют: **{summary['counts']['absent']}** чел.\n\n"
+        f"📊 Всего отмечено: **{summary['total']} чел.**"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ На парах", callback_data=f"rc_present_{group}"),
+            InlineKeyboardButton(text="⏳ Опаздываю", callback_data=f"rc_late_{group}")
+        ],
+        [
+            InlineKeyboardButton(text="📄 Уважительная", callback_data=f"rc_excuse_{group}"),
+            InlineKeyboardButton(text="❌ Отсутствую", callback_data=f"rc_absent_{group}")
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Обновить сводку", callback_data=f"rc_refresh_{group}"),
+            InlineKeyboardButton(text="📱 Открыть в Mini App", url="https://spizhy.github.io/ritm/app.html")
+        ]
+    ])
+
+    try:
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    except Exception:
+        pass
+
+# --- Команда старосты: Быстрая отмена пары ---
+@dp.message(Command("cancel_class"))
+async def cmd_cancel_class(message: types.Message):
+    group = await get_target_group(message)
+    lessons = await get_group_schedule(group, "Пятница")
+    if not lessons:
+        await message.answer("В расписании нет пар для отмены.")
+        return
+
+    kb_rows = []
+    for l in lessons:
+        kb_rows.append([
+            InlineKeyboardButton(
+                text=f"{l['time_start']} {l['subject']}",
+                callback_data=f"docancel_{l['id']}_{group}"
+            )
+        ])
+    kb_rows.append([InlineKeyboardButton(text="Отмена", callback_data="action_cancel")])
+
+    await message.answer(
+        "✏️ **Выберите занятие для отмены или изменения:**",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    )
+
+@dp.callback_query(F.data.startswith("docancel_"))
+async def process_docancel_select(callback: types.CallbackQuery, bot: Bot):
+    parts = callback.data.split("_")
+    lesson_id = parts[1]
+    group = parts[2]
+
+    # Сохраняем отмену
+    await save_cancellation({
+        "group_name": group,
+        "subject": "Высшая математика",
+        "time": "08:30 – 10:00",
+        "status": "CANCELLED",
+        "statusLabel": "ОТМЕНА",
+        "room": "Ауд. 203",
+        "reason": "Занятие отменено старостой через Telegram",
+        "starosta": callback.from_user.full_name,
+        "dateStr": "Сегодня",
+    })
+
+    await callback.answer("Занятие отмечено как отмененное!", show_alert=True)
+    await callback.message.edit_text(
+        f"✅ **Занятие успешно отменено!**\n"
+        f"Информация внесена в расписание группы {group} и разослана в чаты.",
+        parse_mode="Markdown"
+    )
+
+    # Рассылаем оповещение во все чаты группы
+    chats = await get_chats_by_group(group)
+    alert_text = (
+        f"🚨 **ВНИМАНИЕ: ИЗМЕНЕНИЕ В РАСПИСАНИИ!**\n\n"
+        f"Группа: **{group}**\n"
+        f"Занятие: **Высшая математика (08:30 – 10:00)**\n"
+        "Статус: 🔴 **[ОТМЕНА]**\n"
+        f"Причина: _Занятие отменено старостой ({callback.from_user.full_name})_\n\n"
+        "Расписание автоматически обновлено в Mini App!"
+    )
+    for c_id in chats:
+        if c_id != callback.message.chat.id:
+            try:
+                await bot.send_message(c_id, alert_text, parse_mode="Markdown")
+            except Exception:
+                pass
+
+# --- Команда ручного запуска дайджеста ---
+@dp.message(Command("digest"))
+async def cmd_manual_digest(message: types.Message, bot: Bot):
+    group = await get_target_group(message)
+    await send_single_morning_digest(bot, message.chat.id, group)
+
+async def send_single_morning_digest(bot: Bot, chat_id: int, group: str):
+    msk_tz = timezone(timedelta(hours=3))
+    now_msk = datetime.now(msk_tz)
+    weekdays_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    today_weekday = weekdays_ru[now_msk.weekday()]
+    if today_weekday == "Воскресенье":
+        today_weekday = "Понедельник"
+
+    date_formatted = now_msk.strftime("%d.%m.%Y")
+    lessons = await get_group_schedule(group, today_weekday)
+    if not lessons:
+        lessons = await get_group_schedule(group, "Пятница")
+        today_weekday = "Пятница"
+
+    msg = (
+        f"🌅 **ДОБРОЕ УТРО, ГРУППА {group}!**\n"
+        f"📅 {today_weekday}, {date_formatted} (Нечетная неделя)\n\n"
+        "⚡ **Расписание на сегодня:**\n"
+    )
+
+    has_cancellations = False
+    for idx, l in enumerate(lessons, 1):
+        status_tag = ""
+        if l['status'] == 'CANCELLED':
+            status_tag = " 🔴 **[ОТМЕНА]**"
+            has_cancellations = True
+        elif l['status'] == 'DEADLINE':
+            status_tag = " 🟠 **[ДЕДЛАЙН]**"
+        elif l['status'] == 'RESCHEDULED':
+            status_tag = " 🟣 **[ПЕРЕНОС]**"
+
+        msg += f"{idx}. `{l['time_start']}–{l['time_end']}` | **{l['subject']}**{status_tag}\n"
+        msg += f"   ↳ {l.get('room', 'Ауд. не указана')} • {l.get('teacher', '')}\n"
+        if l.get('note'):
+            msg += f"   ↳ ℹ️ _{l['note']}_\n"
+
+    if has_cancellations:
+        msg += "\n⚠️ _Обратите внимание на отмененные занятия выше!_\n"
+
+    msg += (
+        "\n📋 Не забудьте отметиться в перекличке: команда `/rollcall` "
+        "или в [РИТМ Mini App](https://spizhy.github.io/ritm/app.html)"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📱 Открыть РИТМ Mini App", url="https://spizhy.github.io/ritm/app.html"),
+        InlineKeyboardButton(text="📋 Перекличка", callback_data=f"rc_refresh_{group}")
+    ]])
+
+    try:
+        await bot.send_message(chat_id, msg, parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True)
+        logger.info(f"Morning digest sent to chat {chat_id} (group {group})")
+    except Exception as e:
+        logger.error(f"Failed to send morning digest to {chat_id}: {e}")
+
+# Фоновый планировщик утреннего дайджеста в 07:30 MSK
+async def morning_digest_scheduler(bot: Bot):
+    last_sent_date = None
+    logger.info("Morning digest scheduler started (targets 07:30 MSK).")
+    while True:
+        try:
+            msk_tz = timezone(timedelta(hours=3))
+            now_msk = datetime.now(msk_tz)
+            today_str = now_msk.strftime("%Y-%m-%d")
+
+            # Срабатывает в 07:30 по МСК (Пн-Сб)
+            if now_msk.hour == 7 and now_msk.minute == 30 and now_msk.weekday() < 6 and last_sent_date != today_str:
+                last_sent_date = today_str
+                logger.info("Executing scheduled 07:30 MSK morning digest broadcast...")
+                chats = await get_all_active_group_chats()
+                for c in chats:
+                    await send_single_morning_digest(bot, c['chat_id'], c['group_name'])
+                    await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Error in morning digest scheduler: {e}")
+        await asyncio.sleep(25)
+
+# ================= REST API ДЛЯ TELEGRAM MINI APP =================
+
+async def handle_cancellation_api(request: web.Request):
+    try:
+        data = await request.json()
+        group = data.get("group_name", "ИВТ-21").strip().upper()
+        await save_cancellation(data)
+
+        chats = await get_chats_by_group(group)
+        bot: Bot = request.app['bot']
+
+        status_label = data.get("statusLabel", "ОТМЕНА")
+        status_icon = "🔴" if data.get("status") == "CANCELLED" else "🟣"
+
+        alert_text = (
+            f"🚨 **ВНИМАНИЕ: ИЗМЕНЕНИЕ В РАСПИСАНИИ!**\n\n"
+            f"Группа: **{group}**\n"
+            f"Занятие: **{data.get('subject')}**\n"
+            f"Время: `{data.get('time')}`\n"
+            f"Статус: {status_icon} **[{status_label}]**\n"
+            f"Аудитория / формат: **{data.get('room', 'Без изменений')}**\n"
+            f"Причина / Примечание: _{data.get('reason', 'Информация от старосты')}_\n\n"
+            f"👤 Староста: {data.get('starosta', 'Староста группы')}\n\n"
+            "Все изменения внесены в расписание группы!"
+        )
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📱 Открыть в РИТМ Mini App", url="https://spizhy.github.io/ritm/app.html")
+        ]])
+
+        sent_count = 0
+        for chat_id in chats:
+            try:
+                await bot.send_message(chat_id, alert_text, parse_mode="Markdown", reply_markup=kb)
+                sent_count += 1
+            except Exception as e:
+                logger.error(f"Failed to alert chat {chat_id}: {e}")
+
+        return web.json_response({
+            "ok": True,
+            "group": group,
+            "chats_alerted": sent_count
+        }, headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        logger.error(f"Error in cancellation API: {e}")
+        return web.json_response({"ok": False, "error": str(e)}, status=500, headers={"Access-Control-Allow-Origin": "*"})
+
+async def handle_schedule_api(request: web.Request):
+    group = request.query.get("group", "ИВТ-21").strip().upper()
+    lessons = await get_group_schedule(group)
+    return web.json_response({
+        "group": group,
+        "lessons": lessons
+    }, headers={"Access-Control-Allow-Origin": "*"})
+
+async def handle_options(request: web.Request):
+    return web.Response(
+        status=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        }
+    )
+
 # Healthcheck HTTP handler for Cloud PaaS (Render, Koyeb, Railway, etc.)
 async def handle_health(request):
     from database import get_applications_count
@@ -846,7 +1307,7 @@ async def handle_health(request):
         "status": "online",
         "bot": "Ritm_pilot_bot",
         "total_applications": count
-    })
+    }, headers={"Access-Control-Allow-Origin": "*"})
 
 # Main entrypoint
 async def main():
@@ -858,19 +1319,28 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     logger.info("Bot started successfully with expanded questionnaire and admin actions.")
 
-    # Start lightweight HTTP server for Render/Koyeb 24/7 web service keep-alive
+    # Фоновый запуск планировщика утренних дайджестов
+    asyncio.create_task(morning_digest_scheduler(bot))
+
+    # Start lightweight HTTP server for Render/Koyeb 24/7 web service keep-alive & TMA API
     try:
         port = int(os.getenv("PORT", "8080"))
         web_app = web.Application()
+        web_app['bot'] = bot
         web_app.router.add_get("/", handle_health)
         web_app.router.add_get("/health", handle_health)
+        web_app.router.add_post("/api/cancellations", handle_cancellation_api)
+        web_app.router.add_options("/api/cancellations", handle_options)
+        web_app.router.add_get("/api/schedule", handle_schedule_api)
+        web_app.router.add_options("/api/schedule", handle_options)
+
         runner = web.AppRunner(web_app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        logger.info(f"Healthcheck HTTP server listening on port {port}")
+        logger.info(f"HTTP REST & Healthcheck server listening on port {port}")
     except Exception as e:
-        logger.warning(f"Could not start HTTP healthcheck server: {e}")
+        logger.warning(f"Could not start HTTP server: {e}")
 
     while True:
         try:
